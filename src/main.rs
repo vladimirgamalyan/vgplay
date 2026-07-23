@@ -15,7 +15,7 @@ use std::time::Duration;
 use winit::event::{ElementState, Event, MouseButton, WindowEvent};
 use winit::event_loop::EventLoopBuilder;
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Icon, WindowBuilder};
+use winit::window::{Icon, WindowBuilder, WindowButtons};
 
 const BG: u32 = 0x00F5_F5F5; // window background (softbuffer: 0x00RRGGBB)
 
@@ -696,6 +696,10 @@ fn run_sound(path: &Path) {
             .with_window_icon(load_app_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(420.0, 120.0))
             .with_resizable(false)
+            // Disable the maximize button (grayed): the player is fixed-size, so
+            // there is nothing to maximize. Minimize stays active; on Windows the
+            // two are a coupled pair, so a disabled maximize shows grayed.
+            .with_enabled_buttons(WindowButtons::CLOSE | WindowButtons::MINIMIZE)
             .with_visible(false)
             .build(&event_loop)
             .unwrap(),

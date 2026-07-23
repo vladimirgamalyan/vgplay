@@ -1,0 +1,16 @@
+# Rust build output
+/target
+
+# Editor / IDE
+/.vscode/
+/.idea/
+*.iml
+
+# OS cruft
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local test sounds (keep the folder + its README, ignore the media)
+/test-sounds/*
+!/test-sounds/README.md

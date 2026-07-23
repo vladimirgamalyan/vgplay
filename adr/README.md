@@ -53,3 +53,5 @@ The hand-drawn play/stop and repeat controls are documented in vgiew's ADR 0013.
 
 - [0001](0001-vgplay-standalone-sound-player.md) — vgplay is a standalone sound
   player split out of vgiew
+- [0002](0002-single-instance-reuse-player-window.md) — a running player reuses
+  its window for newly opened sounds

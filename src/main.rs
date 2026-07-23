@@ -2,7 +2,9 @@
 // Double-click a sound file in Explorer and a compact player window appears
 // immediately: a play/stop button and a repeat toggle, drawn by hand on the CPU
 // path (no widget toolkit). Audio is initialized lazily — only when a file is
-// actually opened — so launch stays cheap.
+// actually opened — so launch stays cheap. A second launch while a player is
+// already open reuses that window (Windows): the file is handed to the running
+// instance, which stops any current sound and plays the new one.
 #![windows_subsystem = "windows"]
 
 use std::num::NonZeroU32;
@@ -11,7 +13,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use winit::event::{ElementState, Event, MouseButton, WindowEvent};
-use winit::event_loop::EventLoop;
+use winit::event_loop::EventLoopBuilder;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Icon, WindowBuilder};
 
@@ -427,12 +429,236 @@ fn draw_sound_ui(buf: &mut [u32], w: u32, h: u32, playing: bool, repeat: bool) {
     draw_repeat(buf, w, h, c2, d, repeat);
 }
 
+// ── Single-instance IPC (Windows) ─────────────────────────────────────────────
+// The first player to open owns a per-user named pipe and listens on a background
+// thread. A later launch connects to that pipe, sends the file path, and exits;
+// the running instance receives the path over an EventLoopProxy and swaps playback
+// to the new file. This keeps a single player window that always plays the most
+// recently opened sound instead of stacking one window per file.
+
+// Per-user pipe name, as a null-terminated UTF-16 string for the Win32 W APIs.
+// Scoped by username so separate logged-in sessions get separate players.
+#[cfg(windows)]
+fn pipe_name() -> Vec<u16> {
+    let user: String = std::env::var("USERNAME")
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| *c != '\\') // backslash is illegal in a pipe name component
+        .collect();
+    format!(r"\\.\pipe\vgplay-{user}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+// Try to hand `path` to an already-running instance over the named pipe. Returns
+// true if a server accepted it (caller should then exit). Returns false when no
+// server is listening, so the caller becomes the primary instead.
+#[cfg(windows)]
+fn try_handoff(path: &Path) -> bool {
+    use core::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            sec: *mut c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+        fn WriteFile(h: *mut c_void, buf: *const u8, n: u32, written: *mut u32, ov: *mut c_void)
+            -> i32;
+        fn CloseHandle(h: *mut c_void) -> i32;
+        fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
+        fn GetLastError() -> u32;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn AllowSetForegroundWindow(pid: u32) -> i32;
+    }
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const OPEN_EXISTING: u32 = 3;
+    const INVALID: *mut c_void = usize::MAX as *mut c_void; // INVALID_HANDLE_VALUE (-1)
+    const ERROR_PIPE_BUSY: u32 = 231;
+    const ASFW_ANY: u32 = 0xFFFF_FFFF;
+
+    let name = pipe_name();
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    // Retry only the transient "server momentarily busy" case; anything else
+    // (no such pipe) means there is no running instance to hand off to.
+    for _ in 0..10 {
+        let h = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                core::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+        if h != INVALID {
+            unsafe {
+                // Let the running instance pull its window to the foreground.
+                AllowSetForegroundWindow(ASFW_ANY);
+                let mut written = 0u32;
+                WriteFile(
+                    h,
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    &mut written,
+                    core::ptr::null_mut(),
+                );
+                CloseHandle(h);
+            }
+            return true;
+        }
+        if unsafe { GetLastError() } == ERROR_PIPE_BUSY {
+            unsafe { WaitNamedPipeW(name.as_ptr(), 200) };
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+#[cfg(windows)]
+enum ServerResult {
+    Created(usize), // pipe HANDLE as usize (to cross the thread boundary)
+    Exists,         // another instance won the race to become the server
+    Failed,         // IPC unavailable; run standalone
+}
+
+// Try to become the single server by creating the first (and only) instance of
+// the named pipe. FILE_FLAG_FIRST_PIPE_INSTANCE makes this fail with
+// ERROR_ACCESS_DENIED if a server already owns the name, closing the startup race.
+#[cfg(windows)]
+fn create_server() -> ServerResult {
+    use core::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateNamedPipeW(
+            name: *const u16,
+            open_mode: u32,
+            pipe_mode: u32,
+            max_instances: u32,
+            out_buf: u32,
+            in_buf: u32,
+            timeout: u32,
+            sec: *mut c_void,
+        ) -> *mut c_void;
+        fn GetLastError() -> u32;
+    }
+    const PIPE_ACCESS_INBOUND: u32 = 0x0000_0001;
+    const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+    const INVALID: *mut c_void = usize::MAX as *mut c_void;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+
+    let name = pipe_name();
+    let h = unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            0, // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT (all 0)
+            1, // one instance is enough: connections are one-shot and rare
+            0,
+            4096,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    if h != INVALID {
+        ServerResult::Created(h as usize)
+    } else if unsafe { GetLastError() } == ERROR_ACCESS_DENIED {
+        ServerResult::Exists
+    } else {
+        ServerResult::Failed
+    }
+}
+
+// Background accept loop for the primary instance. Blocks on each client, reads
+// the UTF-8 path it sent, and forwards it into the event loop via the proxy.
+#[cfg(windows)]
+fn ipc_server(handle: usize, proxy: winit::event_loop::EventLoopProxy<PathBuf>) {
+    use core::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn ConnectNamedPipe(h: *mut c_void, ov: *mut c_void) -> i32;
+        fn DisconnectNamedPipe(h: *mut c_void) -> i32;
+        fn ReadFile(h: *mut c_void, buf: *mut u8, n: u32, read: *mut u32, ov: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const ERROR_PIPE_CONNECTED: u32 = 535; // a client connected before ConnectNamedPipe
+
+    let h = handle as *mut c_void;
+    loop {
+        let connected = unsafe { ConnectNamedPipe(h, core::ptr::null_mut()) } != 0
+            || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+        if connected {
+            // Read until the client closes its end (byte-stream framing).
+            let mut data = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let mut read = 0u32;
+                let ok = unsafe {
+                    ReadFile(
+                        h,
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                        &mut read,
+                        core::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || read == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..read as usize]);
+            }
+            if let Ok(text) = String::from_utf8(data) {
+                if !text.is_empty() && proxy.send_event(PathBuf::from(text)).is_err() {
+                    return; // the event loop is gone; stop serving
+                }
+            }
+        }
+        unsafe { DisconnectNamedPipe(h) };
+    }
+}
+
 // ── Sound path ──────────────────────────────────────────────────────────────
 // A sound file opens a compact player window with a play/stop button and a repeat
 // toggle. Audio is initialized lazily here (only when a sound is actually opened),
 // so nothing is paid for linking rodio until a file is played.
 fn run_sound(path: &Path) {
-    let path = path.to_path_buf();
+    let mut path = path.to_path_buf();
+
+    // Single-instance: if another vgplay is already showing a player, hand this
+    // file to it and exit. Otherwise become the primary and keep the server pipe
+    // to be serviced by the IPC thread once the event loop's proxy exists. The
+    // short loop covers the startup race where a rival becomes the server between
+    // our handoff attempt and our own create_server call. (Windows only.)
+    #[cfg(windows)]
+    let server_pipe: Option<usize> = {
+        let mut owned = None;
+        for _ in 0..5 {
+            if try_handoff(&path) {
+                return;
+            }
+            match create_server() {
+                ServerResult::Created(h) => {
+                    owned = Some(h);
+                    break;
+                }
+                ServerResult::Exists => continue,
+                ServerResult::Failed => break,
+            }
+        }
+        owned
+    };
+
     // Best-effort playback: open the default output and keep the stream and player
     // alive for the window's lifetime — dropping them stops playback. Any failure
     // (no device) leaves the window up with working buttons but no sound.
@@ -462,7 +688,7 @@ fn run_sound(path: &Path) {
         active = true;
     }
 
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoopBuilder::<PathBuf>::with_user_event().build().unwrap();
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("—");
     let window = Rc::new(
         WindowBuilder::new()
@@ -496,8 +722,32 @@ fn run_sound(path: &Path) {
 
     let mut cursor = (0.0f32, 0.0f32);
 
+    // If we are the primary instance, start servicing handoffs from later launches.
+    #[cfg(windows)]
+    if let Some(h) = server_pipe {
+        let proxy = event_loop.create_proxy();
+        std::thread::spawn(move || ipc_server(h, proxy));
+    }
+
     event_loop
         .run(move |event, elwt| match event {
+            Event::UserEvent(new_path) => {
+                // Another launch handed us a file: stop whatever is playing and
+                // play the new one in this same window, then surface the window.
+                path = new_path;
+                if let Some((_, player)) = &audio {
+                    player.stop();
+                    append_file(player, &path);
+                    active = true;
+                } else {
+                    active = false;
+                }
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("—");
+                window.set_title(&format!("vgplay — {name}"));
+                window.set_minimized(false);
+                window.focus_window();
+                window.request_redraw();
+            }
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => elwt.exit(),
                 WindowEvent::KeyboardInput { event: key, .. } => {

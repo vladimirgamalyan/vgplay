@@ -11,6 +11,9 @@ softbuffer = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 winreg = "0.52"
 rodio = { version = "0.22", default-features = false, features = ["playback", "wav", "mp3", "flac", "vorbis"] }
+# Used only to read the source bit depth for the status line (rodio does not expose
+# it). This is the same symphonia already pulled in transitively by rodio's decoders.
+symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "flac", "mp3", "ogg", "vorbis"] }
 
 [build-dependencies]
 winresource = "0.1"

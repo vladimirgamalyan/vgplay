@@ -55,3 +55,5 @@ The hand-drawn play/stop and repeat controls are documented in vgiew's ADR 0013.
   player split out of vgiew
 - [0002](0002-single-instance-reuse-player-window.md) — a running player reuses
   its window for newly opened sounds
+- [0003](0003-waveform-resizable-window-status-bar.md) — resizable window with a
+  waveform, playback cursor, and status bar

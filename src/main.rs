@@ -1,10 +1,12 @@
 // vgplay — a fast, minimal sound player for Windows (winit + softbuffer + CPU).
-// Double-click a sound file in Explorer and a compact player window appears
-// immediately: a play/stop button and a repeat toggle, drawn by hand on the CPU
-// path (no widget toolkit). Audio is initialized lazily — only when a file is
-// actually opened — so launch stays cheap. A second launch while a player is
-// already open reuses that window (Windows): the file is handed to the running
-// instance, which stops any current sound and plays the new one.
+// Double-click a sound file in Explorer and a resizable player window appears
+// immediately: a waveform with a moving playback cursor, a play/pause and a repeat
+// button, and a status line — all drawn by hand on the CPU path (no widget toolkit).
+// Audio is initialized lazily — only when a file is actually opened — so launch
+// stays cheap; the waveform is decoded off-thread afterwards so it never delays the
+// start. A second launch while a player is already open reuses that window
+// (Windows): the file is handed to the running instance, which stops any current
+// sound and plays the new one.
 #![windows_subsystem = "windows"]
 
 use std::num::NonZeroU32;
@@ -235,6 +237,12 @@ const UI_ON_ICON: u32 = 0x00FF_FFFF; // icon on an accent (enabled) button
 const UI_OFF_FILL: u32 = 0x00E4_E4E4; // repeat button background when off
 const UI_OFF_ICON: u32 = 0x009A_A0A6; // icon on an off button
 
+const WF_PLAYED: u32 = 0x003B_82F6; // waveform, already-played portion (accent)
+const WF_UNPLAYED: u32 = 0x00C2_C7CC; // waveform, not-yet-played portion (gray)
+const WF_AXIS: u32 = 0x00E0_E0E0; // faint per-channel center axis line
+const PLAYHEAD: u32 = 0x0030_3336; // playback cursor line (dark)
+const STATUS_TEXT: u32 = 0x0056_5C63; // status-bar text
+
 const SS: u32 = 4; // supersampling factor per axis for edge anti-aliasing
 
 // Alpha-blend `fg` over `bg` (both 0x00RRGGBB) with coverage `a` in 0..1.
@@ -311,16 +319,22 @@ fn triangle(buf: &mut [u32], w: u32, h: u32, a: (f32, f32), b: (f32, f32), c: (f
     fill_aa(buf, w, h, bb, color, move |px, py| point_in_tri((px, py), a, b, c));
 }
 
-// Left button: an accent disc showing what a click will do — a stop square while a
-// track is playing, a play triangle while stopped.
-fn draw_play_stop(buf: &mut [u32], w: u32, h: u32, c: (f32, f32), d: f32, playing: bool) {
+// Left button: an accent disc showing what a click will do — a pause glyph (two
+// bars) while a track is playing, a play triangle while paused or stopped.
+fn draw_play_pause(buf: &mut [u32], w: u32, h: u32, c: (f32, f32), d: f32, playing: bool) {
     disc(buf, w, h, c.0, c.1, d * 0.5, UI_ACCENT);
     if playing {
-        let s = d * 0.22;
-        let bb = (c.0 - s, c.1 - s, c.0 + s, c.1 + s);
-        fill_aa(buf, w, h, bb, UI_ON_ICON, move |px, py| {
-            (px - c.0).abs() <= s && (py - c.1).abs() <= s
-        });
+        // Two vertical bars.
+        let bw = d * 0.09; // half bar width
+        let bh = d * 0.22; // half bar height
+        let off = d * 0.13; // bar center offset from disc center
+        for sx in [-off, off] {
+            let cx = c.0 + sx;
+            let bb = (cx - bw, c.1 - bh, cx + bw, c.1 + bh);
+            fill_aa(buf, w, h, bb, UI_ON_ICON, move |px, py| {
+                (px - cx).abs() <= bw && (py - c.1).abs() <= bh
+            });
+        }
     } else {
         // Right-pointing triangle, nudged right so it reads as optically centered.
         let t = d * 0.28;
@@ -388,45 +402,276 @@ fn draw_repeat(buf: &mut [u32], w: u32, h: u32, c: (f32, f32), d: f32, on: bool)
     );
 }
 
-// The two buttons' centers and shared radius, in physical pixels, derived from the
-// window size. Shared by drawing and hit-testing so the two never drift apart.
-fn sound_layout(w: u32, h: u32) -> ((f32, f32), (f32, f32), f32) {
-    let (wf, hf) = (w as f32, h as f32);
-    let d = hf * 0.42;
-    let gap = d * 0.5;
-    let x0 = (wf - (d * 2.0 + gap)) * 0.5;
-    let cy = hf * 0.5;
-    let r = d * 0.5;
-    ((x0 + r, cy), (x0 + d * 1.5 + gap, cy), r)
-}
+// ── Bitmap font (5×7, hand-drawn) ─────────────────────────────────────────────
+// The status bar needs text (time, format). The app has no widget/font toolkit
+// (ADR 0001), so glyphs are a tiny 5×7 bitmap drawn as solid pixel blocks, in the
+// same "draw geometry by hand" spirit as the buttons. Only the characters the
+// status line uses are encoded; anything else renders as blank.
+const GLYPH_W: i32 = 5;
+const GLYPH_H: i32 = 7;
 
-enum SoundButton {
-    PlayStop,
-    Repeat,
-}
-
-// Which button, if any, the cursor is over.
-fn sound_button_hit(w: u32, h: u32, cursor: (f32, f32)) -> Option<SoundButton> {
-    let (c1, c2, r) = sound_layout(w, h);
-    let inside = |c: (f32, f32)| {
-        let (dx, dy) = (cursor.0 - c.0, cursor.1 - c.1);
-        dx * dx + dy * dy <= r * r
-    };
-    if inside(c1) {
-        Some(SoundButton::PlayStop)
-    } else if inside(c2) {
-        Some(SoundButton::Repeat)
-    } else {
-        None
+// Each row is 5 bits, MSB = leftmost column. Unknown chars → blank.
+fn glyph(c: char) -> [u8; 7] {
+    match c {
+        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+        '3' => [0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110],
+        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+        '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+        '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+        'D' => [0b11100, 0b10010, 0b10001, 0b10001, 0b10001, 0b10010, 0b11100],
+        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+        'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111],
+        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100],
+        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
+        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+        'N' => [0b10001, 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001],
+        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+        'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
+        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
+        'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+        ':' => [0b00000, 0b00100, 0b00100, 0b00000, 0b00100, 0b00100, 0b00000],
+        '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00110],
+        '/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
+        _ => [0; 7], // space and anything unencoded
     }
 }
 
-fn draw_sound_ui(buf: &mut [u32], w: u32, h: u32, playing: bool, repeat: bool) {
+// Fill a solid, clipped rectangle of pixels with `color`.
+fn fill_rect(buf: &mut [u32], w: u32, h: u32, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
+    let x0 = x0.max(0);
+    let y0 = y0.max(0);
+    let x1 = x1.min(w as i32);
+    let y1 = y1.min(h as i32);
+    for y in y0..y1 {
+        let row = y as u32 * w;
+        for x in x0..x1 {
+            buf[(row + x as u32) as usize] = color;
+        }
+    }
+}
+
+// Draw `text` at (x, y) with each font pixel a `scale`×`scale` block. Uppercased;
+// glyphs are 5×7 with a 1-column gap. Returns nothing; text is drawn solid.
+fn draw_text(buf: &mut [u32], w: u32, h: u32, x: i32, y: i32, scale: i32, color: u32, text: &str) {
+    let mut cx = x;
+    for ch in text.chars() {
+        let g = glyph(ch.to_ascii_uppercase());
+        for (ry, row) in g.iter().enumerate() {
+            for gx in 0..GLYPH_W {
+                if row & (1 << (GLYPH_W - 1 - gx)) != 0 {
+                    let px = cx + gx * scale;
+                    let py = y + ry as i32 * scale;
+                    fill_rect(buf, w, h, px, py, px + scale, py + scale, color);
+                }
+            }
+        }
+        cx += (GLYPH_W + 1) * scale;
+    }
+}
+
+// ── Player layout & rendering ─────────────────────────────────────────────────
+#[derive(Clone, Copy)]
+struct Rect {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+}
+
+impl Rect {
+    fn contains(&self, p: (f32, f32)) -> bool {
+        p.0 >= self.x0 && p.0 <= self.x1 && p.1 >= self.y0 && p.1 <= self.y1
+    }
+    fn width(&self) -> f32 {
+        self.x1 - self.x0
+    }
+}
+
+// All geometry (waveform area, the two buttons, status text origin), in physical
+// pixels, derived from the window size. Shared by drawing and hit-testing so they
+// never drift apart. Everything is a fraction of the window, so it is DPI-agnostic.
+struct Layout {
+    wave: Rect,
+    play: (f32, f32, f32),   // cx, cy, r
+    repeat: (f32, f32, f32), // cx, cy, r
+    status_x: i32,
+    text_scale: i32, // preferred scale from bar height; shrunk to fit width at draw
+}
+
+fn layout(w: u32, h: u32) -> Layout {
+    let (wf, hf) = (w as f32, h as f32);
+    let pad = (hf * 0.05).max(6.0);
+    let bar_h = (hf * 0.24).clamp(30.0, 68.0);
+    let bar_top = hf - bar_h;
+    let wave = Rect {
+        x0: pad,
+        y0: pad,
+        x1: wf - pad,
+        y1: bar_top - pad * 0.5,
+    };
+    let cy = bar_top + bar_h * 0.5;
+    let r = ((bar_h * 0.5 - 5.0).max(9.0)) * 0.82;
+    let gap = r * 0.7;
+    let cx1 = pad + r;
+    let cx2 = cx1 + r * 2.0 + gap;
+    let text_scale = ((bar_h / 20.0) as i32).clamp(1, 4);
+    let status_x = (cx2 + r + gap) as i32;
+    Layout {
+        wave,
+        play: (cx1, cy, r),
+        repeat: (cx2, cy, r),
+        status_x,
+        text_scale,
+    }
+}
+
+// Rendered width of `text` at `scale`, in pixels (glyphs are 5 wide + a 1px gap).
+fn text_width(text: &str, scale: i32) -> i32 {
+    text.chars().count() as i32 * (GLYPH_W + 1) * scale
+}
+
+enum Hit {
+    Play,
+    Repeat,
+    Wave,
+    None,
+}
+
+fn hit_test(lay: &Layout, p: (f32, f32)) -> Hit {
+    let in_disc = |c: (f32, f32, f32)| {
+        let (dx, dy) = (p.0 - c.0, p.1 - c.1);
+        dx * dx + dy * dy <= c.2 * c.2
+    };
+    if in_disc(lay.play) {
+        Hit::Play
+    } else if in_disc(lay.repeat) {
+        Hit::Repeat
+    } else if lay.wave.contains(p) {
+        Hit::Wave
+    } else {
+        Hit::None
+    }
+}
+
+// Aggregate the stored envelope buckets covering pixel column `px` of `cols` into a
+// single (min, max) pair. Multiple buckets per column at narrow widths; multiple
+// columns per bucket at wide widths (block scaling) — both handled by index range.
+fn column_minmax(lane: &[(f32, f32)], px: u32, cols: u32) -> (f32, f32) {
+    if lane.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = lane.len() as u64;
+    let b0 = (px as u64 * n / cols as u64) as usize;
+    let b1 = (((px as u64 + 1) * n / cols as u64) as usize).max(b0 + 1);
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    for &(lo, hi) in &lane[b0..b1.min(lane.len())] {
+        mn = mn.min(lo);
+        mx = mx.max(hi);
+    }
+    if mn > mx {
+        (0.0, 0.0)
+    } else {
+        (mn, mx)
+    }
+}
+
+// Draw one channel's envelope into `lane_rect`, coloring columns left of `played_x`
+// with the played (accent) color and the rest gray.
+fn draw_lane(buf: &mut [u32], w: u32, h: u32, lane_rect: Rect, data: &[(f32, f32)], played_x: f32) {
+    let cols = lane_rect.width().max(1.0) as u32;
+    let cy = (lane_rect.y0 + lane_rect.y1) * 0.5;
+    let half = (lane_rect.y1 - lane_rect.y0) * 0.5 * 0.92;
+    let x0 = lane_rect.x0 as i32;
+    // Faint center axis, so a silent lane still reads as a line.
+    fill_rect(buf, w, h, x0, cy as i32, x0 + cols as i32, cy as i32 + 1, WF_AXIS);
+    for px in 0..cols {
+        let (mn, mx) = column_minmax(data, px, cols);
+        let ytop = (cy - mx * half).min(cy);
+        let ybot = (cy - mn * half).max(cy);
+        let x = x0 + px as i32;
+        let color = if (x as f32) < played_x {
+            WF_PLAYED
+        } else {
+            WF_UNPLAYED
+        };
+        // At least 1px tall so silence still shows a center line.
+        let (yt, yb) = (ytop.floor() as i32, ybot.ceil() as i32);
+        let yb = yb.max(yt + 1);
+        fill_rect(buf, w, h, x, yt, x + 1, yb, color);
+    }
+}
+
+fn draw_waveform(buf: &mut [u32], w: u32, h: u32, area: Rect, wf: &Waveform, frac: Option<f32>) {
+    let nch = wf.lanes.len().min(2).max(1);
+    let played_x = frac.map_or(-1.0, |f| area.x0 + f * area.width());
+    if nch == 1 {
+        draw_lane(buf, w, h, area, &wf.lanes[0], played_x);
+        return;
+    }
+    // Two lanes stacked with a small gap; a faint axis at each lane center.
+    let gap = ((area.y1 - area.y0) * 0.06).max(2.0);
+    let mid = (area.y0 + area.y1) * 0.5;
+    let top = Rect {
+        y1: mid - gap * 0.5,
+        ..area
+    };
+    let bot = Rect {
+        y0: mid + gap * 0.5,
+        ..area
+    };
+    draw_lane(buf, w, h, top, &wf.lanes[0], played_x);
+    draw_lane(buf, w, h, bot, &wf.lanes[1], played_x);
+}
+
+// Full UI: background, waveform, playhead, the two buttons, and the status text.
+struct UiState<'a> {
+    playing: bool, // pause glyph shown when true; play triangle otherwise
+    repeat: bool,
+    frac: Option<f32>, // playhead position, 0..1
+    waveform: Option<&'a Waveform>,
+    status: &'a str,
+}
+
+fn draw_ui(buf: &mut [u32], w: u32, h: u32, s: &UiState) {
     buf.iter_mut().for_each(|p| *p = BG);
-    let (c1, c2, r) = sound_layout(w, h);
-    let d = r * 2.0;
-    draw_play_stop(buf, w, h, c1, d, playing);
-    draw_repeat(buf, w, h, c2, d, repeat);
+    let lay = layout(w, h);
+    if let Some(wf) = s.waveform {
+        draw_waveform(buf, w, h, lay.wave, wf, s.frac);
+    }
+    if let Some(f) = s.frac {
+        let x = (lay.wave.x0 + f * lay.wave.width()) as i32;
+        let lw = ((h as f32 * 0.004).round() as i32).max(1);
+        fill_rect(buf, w, h, x, lay.wave.y0 as i32, x + lw, lay.wave.y1 as i32, PLAYHEAD);
+    }
+    draw_play_pause(buf, w, h, (lay.play.0, lay.play.1), lay.play.2 * 2.0, s.playing);
+    draw_repeat(buf, w, h, (lay.repeat.0, lay.repeat.1), lay.repeat.2 * 2.0, s.repeat);
+    // Shrink the status text below the bar-height scale if it would overflow the width.
+    let avail = (lay.wave.x1 as i32 - lay.status_x).max(1);
+    let fit = avail / text_width(s.status, 1).max(1);
+    let scale = fit.clamp(1, lay.text_scale);
+    let ty = (lay.play.1 - (GLYPH_H * scale) as f32 * 0.5) as i32;
+    draw_text(buf, w, h, lay.status_x, ty, scale, STATUS_TEXT, s.status);
 }
 
 // ── Single-instance IPC (Windows) ─────────────────────────────────────────────
@@ -583,7 +828,7 @@ fn create_server() -> ServerResult {
 // Background accept loop for the primary instance. Blocks on each client, reads
 // the UTF-8 path it sent, and forwards it into the event loop via the proxy.
 #[cfg(windows)]
-fn ipc_server(handle: usize, proxy: winit::event_loop::EventLoopProxy<PathBuf>) {
+fn ipc_server(handle: usize, proxy: winit::event_loop::EventLoopProxy<AppEvent>) {
     use core::ffi::c_void;
     #[link(name = "kernel32")]
     extern "system" {
@@ -619,7 +864,11 @@ fn ipc_server(handle: usize, proxy: winit::event_loop::EventLoopProxy<PathBuf>) 
                 data.extend_from_slice(&buf[..read as usize]);
             }
             if let Ok(text) = String::from_utf8(data) {
-                if !text.is_empty() && proxy.send_event(PathBuf::from(text)).is_err() {
+                if !text.is_empty()
+                    && proxy
+                        .send_event(AppEvent::Open(PathBuf::from(text)))
+                        .is_err()
+                {
                     return; // the event loop is gone; stop serving
                 }
             }
@@ -628,10 +877,194 @@ fn ipc_server(handle: usize, proxy: winit::event_loop::EventLoopProxy<PathBuf>) 
     }
 }
 
+// ── Waveform analysis (background) ────────────────────────────────────────────
+// Drawing a waveform needs the whole file decoded; doing that on the launch path
+// would delay playback, which must stay instant. So playback starts first (lazy
+// decoder, as before) and the file is decoded a *second* time on a background
+// thread purely to compute a per-channel min/max envelope. The result is delivered
+// back into the event loop; the waveform simply "pops in" a moment later.
+
+// Target stored resolution per channel. The envelope is re-bucketed to the window
+// width at draw time, so this only bounds memory (~2·WF_RES pairs per channel),
+// not the on-screen detail.
+const WF_RES: usize = 2048;
+
+struct Waveform {
+    gen: u64,                    // matches the open that requested it (stale results dropped)
+    lanes: Vec<Vec<(f32, f32)>>, // per-channel (min, max) envelope
+    duration: Duration,
+    sample_rate: u32,
+    channels: u16,
+    bits: Option<u16>, // source bit depth; None for lossy codecs (mp3/vorbis)
+}
+
+// The two event-loop messages: a file handed over by a later launch (IPC), and a
+// finished waveform analysis.
+enum AppEvent {
+    Open(PathBuf),
+    Waveform(Waveform),
+}
+
+// Merge adjacent buckets pairwise, halving the count — used to keep the envelope
+// bounded while streaming a file of unknown length.
+fn halve(lane: &mut Vec<(f32, f32)>) {
+    let mut out = Vec::with_capacity(lane.len() / 2 + 1);
+    let mut i = 0;
+    while i < lane.len() {
+        if i + 1 < lane.len() {
+            out.push((lane[i].0.min(lane[i + 1].0), lane[i].1.max(lane[i + 1].1)));
+        } else {
+            out.push(lane[i]);
+        }
+        i += 2;
+    }
+    *lane = out;
+}
+
+// Read the source bit depth from the container header (rodio does not expose it).
+// This is a cheap header-only probe with symphonia — no full decode. Returns None
+// for lossy codecs (mp3, vorbis) that have no fixed bit depth.
+fn probe_bits(path: &Path) -> Option<u16> {
+    use symphonia::core::codecs::CODEC_TYPE_NULL;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+    let file = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+    let track = probed
+        .format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)?;
+    track.codec_params.bits_per_sample.map(|b| b as u16)
+}
+
+// Decode the whole file and build a per-channel min/max envelope. Streams the
+// samples with adaptive downsampling so memory stays bounded regardless of length;
+// duration is derived from the exact decoded frame count. Returns None on any
+// decode failure (the window then just shows no waveform).
+fn analyze(path: &Path, gen: u64) -> Option<Waveform> {
+    use rodio::Source;
+    let file = std::fs::File::open(path).ok()?;
+    let decoder = rodio::Decoder::try_from(file).ok()?;
+    let sample_rate = decoder.sample_rate().get();
+    let ch = decoder.channels().get() as usize;
+    if ch == 0 {
+        return None;
+    }
+    let bits = probe_bits(path);
+
+    let mut lanes: Vec<Vec<(f32, f32)>> = vec![Vec::with_capacity(2 * WF_RES); ch];
+    let mut cur = vec![(f32::INFINITY, f32::NEG_INFINITY); ch]; // current bucket per channel
+    let mut frames_in_cur: u64 = 0;
+    let mut frames_per_bucket: u64 = 1;
+    let mut total_frames: u64 = 0;
+    let mut c = 0usize;
+
+    for s in decoder {
+        let a = &mut cur[c];
+        a.0 = a.0.min(s);
+        a.1 = a.1.max(s);
+        c += 1;
+        if c == ch {
+            c = 0;
+            frames_in_cur += 1;
+            total_frames += 1;
+            if frames_in_cur == frames_per_bucket {
+                for ci in 0..ch {
+                    lanes[ci].push(cur[ci]);
+                    cur[ci] = (f32::INFINITY, f32::NEG_INFINITY);
+                }
+                frames_in_cur = 0;
+                if lanes[0].len() >= 2 * WF_RES {
+                    for lane in &mut lanes {
+                        halve(lane);
+                    }
+                    frames_per_bucket *= 2;
+                }
+            }
+        }
+    }
+    // Flush a partial trailing bucket.
+    if frames_in_cur > 0 {
+        for ci in 0..ch {
+            lanes[ci].push(cur[ci]);
+        }
+    }
+    if total_frames == 0 {
+        return None;
+    }
+
+    let duration = Duration::from_secs_f64(total_frames as f64 / sample_rate as f64);
+    Some(Waveform {
+        gen,
+        lanes,
+        duration,
+        sample_rate,
+        channels: ch as u16,
+        bits,
+    })
+}
+
+fn spawn_analysis(path: PathBuf, gen: u64, proxy: winit::event_loop::EventLoopProxy<AppEvent>) {
+    std::thread::spawn(move || {
+        if let Some(wf) = analyze(&path, gen) {
+            let _ = proxy.send_event(AppEvent::Waveform(wf));
+        }
+    });
+}
+
+// "M:SS" from a duration (minutes are not zero-padded; seconds are).
+fn fmt_time(d: Duration) -> String {
+    let secs = d.as_secs();
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+// A one-line status: FORMAT, sample rate (full Hz), bit depth (when the codec has
+// one), channel layout, position / duration. Fields are separated by three spaces.
+fn status_line(path: &Path, wf: Option<&Waveform>, pos: Duration) -> String {
+    let fmt = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_uppercase())
+        .unwrap_or_default();
+    match wf {
+        None => fmt,
+        Some(wf) => {
+            let chans = match wf.channels {
+                1 => "MONO".to_string(),
+                2 => "STEREO".to_string(),
+                n => format!("{}CH", n),
+            };
+            let mut parts = vec![fmt, format!("{} HZ", wf.sample_rate)];
+            if let Some(bits) = wf.bits {
+                parts.push(format!("{} BIT", bits));
+            }
+            parts.push(chans);
+            parts.push(format!("{} / {}", fmt_time(pos), fmt_time(wf.duration)));
+            parts.join("   ")
+        }
+    }
+}
+
 // ── Sound path ──────────────────────────────────────────────────────────────
-// A sound file opens a compact player window with a play/stop button and a repeat
-// toggle. Audio is initialized lazily here (only when a sound is actually opened),
-// so nothing is paid for linking rodio until a file is played.
+// A sound file opens a resizable player window: a waveform with a moving playback
+// cursor, a play/pause and a repeat button, and a status line. Audio is initialized
+// lazily here (only when a sound is actually opened), so nothing is paid for linking
+// rodio until a file is played; the waveform is computed off-thread afterwards.
 fn run_sound(path: &Path) {
     let mut path = path.to_path_buf();
 
@@ -679,27 +1112,32 @@ fn run_sound(path: &Path) {
         }
     }
 
-    // `active` is the play/stop state (true while a track is playing or looping);
-    // it drives the button glyph. Playback starts automatically on open.
-    let mut active = false;
+    // Player state. `has_track` is true while a source is loaded (playing or paused);
+    // `paused` distinguishes the two. Together they drive the play/pause glyph.
+    // Playback starts automatically on open. `gen` tags each opened file so a late
+    // waveform result from a previous file is ignored (window reuse, ADR 0002).
+    let mut has_track = false;
+    let mut paused = false;
     let mut repeat = false;
+    let mut gen: u64 = 0;
+    let mut waveform: Option<Waveform> = None;
+    let mut dragging = false; // scrubbing the playhead with the mouse
+    let mut drag_frac = 0.0f32;
     if let Some((_, player)) = &audio {
         append_file(player, &path);
-        active = true;
+        has_track = true;
     }
 
-    let event_loop = EventLoopBuilder::<PathBuf>::with_user_event().build().unwrap();
+    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build().unwrap();
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("—");
     let window = Rc::new(
         WindowBuilder::new()
             .with_title(format!("vgplay — {name}"))
             .with_window_icon(load_app_icon())
-            .with_inner_size(winit::dpi::LogicalSize::new(420.0, 120.0))
-            .with_resizable(false)
-            // Disable the maximize button (grayed): the player is fixed-size, so
-            // there is nothing to maximize. Minimize stays active; on Windows the
-            // two are a coupled pair, so a disabled maximize shows grayed.
-            .with_enabled_buttons(WindowButtons::CLOSE | WindowButtons::MINIMIZE)
+            .with_inner_size(winit::dpi::LogicalSize::new(640.0, 260.0))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(360.0, 180.0))
+            .with_resizable(true)
+            .with_enabled_buttons(WindowButtons::all())
             .with_visible(false)
             .build(&event_loop)
             .unwrap(),
@@ -719,38 +1157,67 @@ fn run_sound(path: &Path) {
             .unwrap();
         let mut buffer = surface.buffer_mut().unwrap();
         let slice: &mut [u32] = &mut buffer;
-        draw_sound_ui(slice, w, h, active, repeat);
+        // First frame: UI with an empty waveform. It fills in when analysis finishes.
+        let status = status_line(&path, None, Duration::ZERO);
+        draw_ui(
+            slice,
+            w,
+            h,
+            &UiState {
+                playing: has_track,
+                repeat,
+                frac: None,
+                waveform: None,
+                status: &status,
+            },
+        );
         buffer.present().unwrap();
     }
     set_cloak(&window, false);
 
     let mut cursor = (0.0f32, 0.0f32);
 
+    // Playback has started; now decode the file off-thread to build the waveform.
+    let proxy = event_loop.create_proxy();
+    spawn_analysis(path.clone(), gen, proxy.clone());
+
     // If we are the primary instance, start servicing handoffs from later launches.
     #[cfg(windows)]
     if let Some(h) = server_pipe {
-        let proxy = event_loop.create_proxy();
-        std::thread::spawn(move || ipc_server(h, proxy));
+        let ipc_proxy = event_loop.create_proxy();
+        std::thread::spawn(move || ipc_server(h, ipc_proxy));
     }
 
     event_loop
         .run(move |event, elwt| match event {
-            Event::UserEvent(new_path) => {
+            Event::UserEvent(AppEvent::Open(new_path)) => {
                 // Another launch handed us a file: stop whatever is playing and
                 // play the new one in this same window, then surface the window.
                 path = new_path;
+                gen += 1;
+                waveform = None;
+                dragging = false;
+                paused = false;
                 if let Some((_, player)) = &audio {
                     player.stop();
                     append_file(player, &path);
-                    active = true;
+                    has_track = true;
                 } else {
-                    active = false;
+                    has_track = false;
                 }
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("—");
                 window.set_title(&format!("vgplay — {name}"));
                 window.set_minimized(false);
                 window.focus_window();
+                spawn_analysis(path.clone(), gen, proxy.clone());
                 window.request_redraw();
+            }
+            Event::UserEvent(AppEvent::Waveform(wf)) => {
+                // Ignore a result for a file that has since been replaced.
+                if wf.gen == gen {
+                    waveform = Some(wf);
+                    window.request_redraw();
+                }
             }
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => elwt.exit(),
@@ -764,7 +1231,18 @@ fn run_sound(path: &Path) {
                 WindowEvent::CursorMoved { position, .. } => {
                     cursor = (position.x as f32, position.y as f32);
                     let size = window.inner_size();
-                    let hovering = sound_button_hit(size.width, size.height, cursor).is_some();
+                    let lay = layout(size.width, size.height);
+                    if dragging {
+                        drag_frac =
+                            ((cursor.0 - lay.wave.x0) / lay.wave.width()).clamp(0.0, 1.0);
+                        window.request_redraw();
+                    }
+                    // The waveform is only interactive once it (and the duration) exist.
+                    let hovering = match hit_test(&lay, cursor) {
+                        Hit::Play | Hit::Repeat => true,
+                        Hit::Wave => waveform.is_some(),
+                        Hit::None => false,
+                    };
                     window.set_cursor_icon(if hovering {
                         winit::window::CursorIcon::Pointer
                     } else {
@@ -772,28 +1250,59 @@ fn run_sound(path: &Path) {
                     });
                 }
                 WindowEvent::MouseInput { state, button, .. } => {
-                    if button != MouseButton::Left || state != ElementState::Pressed {
+                    if button != MouseButton::Left {
                         return;
                     }
                     let size = window.inner_size();
-                    match sound_button_hit(size.width, size.height, cursor) {
-                        Some(SoundButton::PlayStop) => {
-                            if let Some((_, player)) = &audio {
-                                if active {
-                                    player.stop();
-                                    active = false;
-                                } else {
-                                    append_file(player, &path);
-                                    active = true;
+                    let lay = layout(size.width, size.height);
+                    match state {
+                        ElementState::Pressed => match hit_test(&lay, cursor) {
+                            Hit::Play => {
+                                if let Some((_, player)) = &audio {
+                                    if !has_track {
+                                        append_file(player, &path);
+                                        has_track = true;
+                                        paused = false;
+                                    } else if paused {
+                                        player.play();
+                                        paused = false;
+                                    } else {
+                                        player.pause();
+                                        paused = true;
+                                    }
+                                    window.request_redraw();
+                                }
+                            }
+                            Hit::Repeat => {
+                                repeat = !repeat;
+                                window.request_redraw();
+                            }
+                            Hit::Wave => {
+                                if waveform.is_some() {
+                                    dragging = true;
+                                    drag_frac = ((cursor.0 - lay.wave.x0) / lay.wave.width())
+                                        .clamp(0.0, 1.0);
+                                    window.request_redraw();
+                                }
+                            }
+                            Hit::None => {}
+                        },
+                        ElementState::Released => {
+                            if dragging {
+                                dragging = false;
+                                if let (Some((_, player)), Some(wf)) = (&audio, &waveform) {
+                                    let target = wf.duration.mul_f64(drag_frac as f64);
+                                    // Scrubbing from a stopped state cues playback there.
+                                    if !has_track {
+                                        append_file(player, &path);
+                                        has_track = true;
+                                        paused = false;
+                                    }
+                                    let _ = player.try_seek(target);
                                 }
                                 window.request_redraw();
                             }
                         }
-                        Some(SoundButton::Repeat) => {
-                            repeat = !repeat;
-                            window.request_redraw();
-                        }
-                        None => {}
                     }
                 }
                 WindowEvent::RedrawRequested => {
@@ -802,35 +1311,71 @@ fn run_sound(path: &Path) {
                     surface
                         .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
                         .unwrap();
+
+                    // Playhead position: the drag target while scrubbing, otherwise the
+                    // live playback position (or the start when stopped).
+                    let dur = waveform.as_ref().map(|wf| wf.duration);
+                    let pos = match &audio {
+                        Some((_, player)) if has_track => player.get_pos(),
+                        _ => Duration::ZERO,
+                    };
+                    let (frac, disp_pos) = if dragging {
+                        let p = dur.map(|d| d.mul_f64(drag_frac as f64)).unwrap_or(Duration::ZERO);
+                        (Some(drag_frac), p)
+                    } else {
+                        match dur {
+                            Some(d) if has_track && d.as_secs_f64() > 0.0 => (
+                                Some((pos.as_secs_f64() / d.as_secs_f64()).clamp(0.0, 1.0) as f32),
+                                pos,
+                            ),
+                            Some(_) => (Some(0.0), Duration::ZERO),
+                            None => (None, Duration::ZERO),
+                        }
+                    };
+                    let status = status_line(&path, waveform.as_ref(), disp_pos);
+
                     let mut buffer = surface.buffer_mut().unwrap();
                     let slice: &mut [u32] = &mut buffer;
-                    draw_sound_ui(slice, w, h, active, repeat);
+                    draw_ui(
+                        slice,
+                        w,
+                        h,
+                        &UiState {
+                            playing: has_track && !paused,
+                            repeat,
+                            frac,
+                            waveform: waveform.as_ref(),
+                            status: &status,
+                        },
+                    );
                     buffer.present().unwrap();
                 }
                 _ => {}
             },
             Event::AboutToWait => {
-                // Detect the track's natural end to reset the button — and to loop it
-                // when repeat is on. Poll only while active; stay idle otherwise.
-                if active {
+                // Detect the track's natural end: loop it when repeat is on, otherwise
+                // reset to a stopped state. Only meaningful while actually playing.
+                if has_track && !paused {
                     if let Some((_, player)) = &audio {
                         if player.empty() {
                             if repeat {
                                 append_file(player, &path);
                             } else {
-                                active = false;
+                                has_track = false;
                             }
                             window.request_redraw();
                         }
                     }
                 }
-                elwt.set_control_flow(if active {
-                    winit::event_loop::ControlFlow::WaitUntil(
-                        std::time::Instant::now() + Duration::from_millis(50),
-                    )
+                // Animate the playhead ~30fps while playing; stay idle otherwise.
+                if has_track && !paused {
+                    window.request_redraw();
+                    elwt.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                        std::time::Instant::now() + Duration::from_millis(33),
+                    ));
                 } else {
-                    winit::event_loop::ControlFlow::Wait
-                });
+                    elwt.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                }
             }
             _ => {}
         })

@@ -1787,6 +1787,7 @@ dependencies = [
  "image",
  "rodio",
  "softbuffer",
+ "symphonia",
  "winit",
  "winreg",
  "winresource",

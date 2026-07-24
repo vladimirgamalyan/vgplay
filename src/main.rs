@@ -1112,6 +1112,23 @@ fn run_sound(path: &Path) {
         }
     }
 
+    // Toggle play/pause exactly like the on-screen play button: cue a fresh track
+    // from the start when stopped, otherwise flip between playing and paused. Shared
+    // by the button hit and the Space key so the two never drift apart.
+    fn toggle_play(player: &rodio::Player, path: &Path, has_track: &mut bool, paused: &mut bool) {
+        if !*has_track {
+            append_file(player, path);
+            *has_track = true;
+            *paused = false;
+        } else if *paused {
+            player.play();
+            *paused = false;
+        } else {
+            player.pause();
+            *paused = true;
+        }
+    }
+
     // Player state. `has_track` is true while a source is loaded (playing or paused);
     // `paused` distinguishes the two. Together they drive the play/pause glyph.
     // Playback starts automatically on open. `gen` tags each opened file so a late
@@ -1222,10 +1239,18 @@ fn run_sound(path: &Path) {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => elwt.exit(),
                 WindowEvent::KeyboardInput { event: key, .. } => {
-                    if key.state == ElementState::Pressed
-                        && matches!(key.logical_key.as_ref(), Key::Named(NamedKey::Escape))
-                    {
-                        elwt.exit();
+                    // Ignore auto-repeat so holding Space doesn't rapidly toggle.
+                    if key.state == ElementState::Pressed && !key.repeat {
+                        match key.logical_key.as_ref() {
+                            Key::Named(NamedKey::Escape) => elwt.exit(),
+                            Key::Named(NamedKey::Space) => {
+                                if let Some((_, player)) = &audio {
+                                    toggle_play(player, &path, &mut has_track, &mut paused);
+                                    window.request_redraw();
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
@@ -1259,17 +1284,7 @@ fn run_sound(path: &Path) {
                         ElementState::Pressed => match hit_test(&lay, cursor) {
                             Hit::Play => {
                                 if let Some((_, player)) = &audio {
-                                    if !has_track {
-                                        append_file(player, &path);
-                                        has_track = true;
-                                        paused = false;
-                                    } else if paused {
-                                        player.play();
-                                        paused = false;
-                                    } else {
-                                        player.pause();
-                                        paused = true;
-                                    }
+                                    toggle_play(player, &path, &mut has_track, &mut paused);
                                     window.request_redraw();
                                 }
                             }

@@ -227,6 +227,53 @@ fn unregister() -> std::io::Result<()> {
     Ok(())
 }
 
+// ── Window size persistence ───────────────────────────────────────────────────
+// The player's window size is remembered across launches in HKCU (the same hive
+// the associations live in — no separate config file). Stored as the *logical*
+// size so it is DPI-independent: a window sized on a 150% monitor reopens the same
+// on a 100% one. Missing or garbage values simply fall back to the default size.
+
+#[cfg(windows)]
+fn load_window_size() -> Option<(u32, u32)> {
+    use winreg::RegKey;
+    let key = RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey("Software\\vgplay")
+        .ok()?;
+    let w: u32 = key.get_value("WindowWidth").ok()?;
+    let h: u32 = key.get_value("WindowHeight").ok()?;
+    (w > 0 && h > 0).then_some((w, h))
+}
+#[cfg(not(windows))]
+fn load_window_size() -> Option<(u32, u32)> {
+    None
+}
+
+#[cfg(windows)]
+fn save_window_size(w: u32, h: u32) {
+    use winreg::RegKey;
+    if let Ok((key, _)) =
+        RegKey::predef(winreg::enums::HKEY_CURRENT_USER).create_subkey("Software\\vgplay")
+    {
+        let _ = key.set_value("WindowWidth", &w);
+        let _ = key.set_value("WindowHeight", &h);
+    }
+}
+#[cfg(not(windows))]
+fn save_window_size(_w: u32, _h: u32) {}
+
+// Persist the window's current logical size, unless it is maximized (a maximized
+// window's size is the screen, not a size the user chose — keep the last normal one).
+fn persist_window_size(window: &winit::window::Window) {
+    if window.is_maximized() {
+        return;
+    }
+    let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+    let (w, h) = (size.width.round() as u32, size.height.round() as u32);
+    if w > 0 && h > 0 {
+        save_window_size(w, h);
+    }
+}
+
 // ── Sound player UI (hand-drawn; no widget toolkit) ──────────────────────────
 // The sound window shows two round buttons: play/stop (left) and a repeat toggle
 // (right). Shapes are supersampled for anti-aliasing and the whole UI is redrawn
@@ -1147,11 +1194,12 @@ fn run_sound(path: &Path) {
 
     let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build().unwrap();
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("—");
+    let (init_w, init_h) = load_window_size().unwrap_or((640, 260));
     let window = Rc::new(
         WindowBuilder::new()
             .with_title(format!("vgplay — {name}"))
             .with_window_icon(load_app_icon())
-            .with_inner_size(winit::dpi::LogicalSize::new(640.0, 260.0))
+            .with_inner_size(winit::dpi::LogicalSize::new(init_w as f64, init_h as f64))
             .with_min_inner_size(winit::dpi::LogicalSize::new(360.0, 180.0))
             .with_resizable(true)
             .with_enabled_buttons(WindowButtons::all())
@@ -1237,12 +1285,18 @@ fn run_sound(path: &Path) {
                 }
             }
             Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => elwt.exit(),
+                WindowEvent::CloseRequested => {
+                    persist_window_size(&window);
+                    elwt.exit();
+                }
                 WindowEvent::KeyboardInput { event: key, .. } => {
                     // Ignore auto-repeat so holding Space doesn't rapidly toggle.
                     if key.state == ElementState::Pressed && !key.repeat {
                         match key.logical_key.as_ref() {
-                            Key::Named(NamedKey::Escape) => elwt.exit(),
+                            Key::Named(NamedKey::Escape) => {
+                                persist_window_size(&window);
+                                elwt.exit();
+                            }
                             Key::Named(NamedKey::Space) => {
                                 if let Some((_, player)) = &audio {
                                     toggle_play(player, &path, &mut has_track, &mut paused);

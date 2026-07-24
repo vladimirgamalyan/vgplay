@@ -1107,6 +1107,75 @@ fn status_line(path: &Path, wf: Option<&Waveform>, pos: Duration) -> String {
     }
 }
 
+// ── Neighbor navigation (arrow keys) ─────────────────────────────────────────
+// Left/Right step to the previous/next sound in the same folder and play it, as
+// if that file had been opened from Explorer. Files are ordered the way Explorer
+// orders them so the step matches what the user sees in the folder.
+
+// Compare two files the way Explorer's file list does: a natural, digit-aware,
+// case-insensitive order (so "track2" precedes "track10"). StrCmpLogicalW is the
+// very comparator Explorer uses, so arrow-key order matches the folder view.
+#[cfg(windows)]
+fn explorer_cmp(a: &Path, b: &Path) -> std::cmp::Ordering {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "shlwapi")]
+    extern "system" {
+        fn StrCmpLogicalW(psz1: *const u16, psz2: *const u16) -> i32;
+    }
+    let wide = |p: &Path| -> Vec<u16> {
+        p.file_name()
+            .unwrap_or_default()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let (wa, wb) = (wide(a), wide(b));
+    unsafe { StrCmpLogicalW(wa.as_ptr(), wb.as_ptr()) }.cmp(&0)
+}
+
+// Non-Windows fallback: a plain case-insensitive file-name ordering.
+#[cfg(not(windows))]
+fn explorer_cmp(a: &Path, b: &Path) -> std::cmp::Ordering {
+    let key = |p: &Path| {
+        p.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_lowercase()
+    };
+    key(a).cmp(&key(b))
+}
+
+// The sound file adjacent to `path` in its directory, in Explorer's order.
+// `delta` is -1 for the previous file, +1 for the next. Returns None when there
+// is no neighbor in that direction (navigation stops at the ends, it does not
+// wrap) or the directory cannot be read.
+fn sibling_sound(path: &Path, delta: i32) -> Option<PathBuf> {
+    let dir = path.parent()?;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| SOUND_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        })
+        .collect();
+    files.sort_by(|a, b| explorer_cmp(a, b));
+    // Locate the current file by name, case-insensitively: the filesystem is
+    // case-insensitive on Windows, so the opened path's casing may differ from
+    // the directory entry's.
+    let cur = files.iter().position(|p| match (p.file_name(), path.file_name()) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    })?;
+    let idx = cur as i32 + delta;
+    (0..files.len() as i32)
+        .contains(&idx)
+        .then(|| files[idx as usize].clone())
+}
+
 // ── Sound path ──────────────────────────────────────────────────────────────
 // A sound file opens a resizable player window: a waveform with a moving playback
 // cursor, a play/pause and a repeat button, and a status line. Audio is initialized
@@ -1305,6 +1374,19 @@ fn run_sound(path: &Path) {
                                 if let Some((_, player)) = &audio {
                                     toggle_play(player, &path, &mut has_track, &mut paused);
                                     window.request_redraw();
+                                }
+                            }
+                            // Left/Right: open and play the previous/next sound in
+                            // the folder, reusing the same swap path as an Explorer
+                            // open (AppEvent::Open) so behavior is identical.
+                            Key::Named(NamedKey::ArrowLeft) => {
+                                if let Some(prev) = sibling_sound(&path, -1) {
+                                    let _ = proxy.send_event(AppEvent::Open(prev));
+                                }
+                            }
+                            Key::Named(NamedKey::ArrowRight) => {
+                                if let Some(next) = sibling_sound(&path, 1) {
+                                    let _ = proxy.send_event(AppEvent::Open(next));
                                 }
                             }
                             _ => {}

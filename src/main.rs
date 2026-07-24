@@ -1266,6 +1266,10 @@ fn run_sound(path: &Path) {
                 if let Some((_, player)) = &audio {
                     player.stop();
                     append_file(player, &path);
+                    // Clear any lingering pause from before the swap: stop()/append()
+                    // reset the queue but not rodio's pause flag, so without this the
+                    // new track would be silently paused while we show it as playing.
+                    player.play();
                     has_track = true;
                 } else {
                     has_track = false;

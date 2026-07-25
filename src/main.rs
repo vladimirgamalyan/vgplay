@@ -23,6 +23,15 @@ const BG: u32 = 0x00F5_F5F5; // window background (softbuffer: 0x00RRGGBB)
 
 const SOUND_EXTS: &[&str] = &["wav", "mp3", "flac", "ogg"];
 
+// Is `path` a sound vgplay opens? Extension-only and case-insensitive — the same
+// test the associations register. Used to pick neighbors in a folder and to filter
+// what a drag-and-drop delivers.
+fn is_sound(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| SOUND_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
 fn load_app_icon() -> Option<Icon> {
     let rgba = image::load_from_memory(include_bytes!("../assets/icon.png"))
         .ok()?
@@ -1155,12 +1164,7 @@ fn sibling_sound(path: &Path, delta: i32) -> Option<PathBuf> {
         .ok()?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| SOUND_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        })
+        .filter(|p| p.is_file() && is_sound(p))
         .collect();
     files.sort_by(|a, b| explorer_cmp(a, b));
     // Locate the current file by name, case-insensitively: the filesystem is
@@ -1256,6 +1260,7 @@ fn run_sound(path: &Path) {
     let mut waveform: Option<Waveform> = None;
     let mut dragging = false; // scrubbing the playhead with the mouse
     let mut drag_frac = 0.0f32;
+    let mut pending_drop: Option<PathBuf> = None; // first sound of a dropped batch
     if let Some((_, player)) = &audio {
         append_file(player, &path);
         has_track = true;
@@ -1393,6 +1398,15 @@ fn run_sound(path: &Path) {
                         }
                     }
                 }
+                // Drag and drop: a drop delivers one DroppedFile event per file.
+                // Keep the first sound of the batch and ignore the rest (folders,
+                // unsupported types, further files); it is opened in AboutToWait,
+                // once the whole batch has arrived.
+                WindowEvent::DroppedFile(dropped) => {
+                    if pending_drop.is_none() && dropped.is_file() && is_sound(&dropped) {
+                        pending_drop = Some(dropped);
+                    }
+                }
                 WindowEvent::CursorMoved { position, .. } => {
                     cursor = (position.x as f32, position.y as f32);
                     let size = window.inner_size();
@@ -1508,6 +1522,11 @@ fn run_sound(path: &Path) {
                 _ => {}
             },
             Event::AboutToWait => {
+                // Play what a drag-and-drop delivered, through the same swap path as
+                // an Explorer open (AppEvent::Open) so behavior is identical.
+                if let Some(dropped) = pending_drop.take() {
+                    let _ = proxy.send_event(AppEvent::Open(dropped));
+                }
                 // Detect the track's natural end: loop it when repeat is on, otherwise
                 // reset to a stopped state. Only meaningful while actually playing.
                 if has_track && !paused {
